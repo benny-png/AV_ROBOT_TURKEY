@@ -1,0 +1,25 @@
+# Ignore environment files
+.env
+.venv
+
+# Ignore database files
+*.db
+
+
+# Ignore other common files
+__pycache__/
+*.py[cod]
+*.so
+*.log
+*.sqlite3
+*.DS_Store
+.idea/
+.vscode/
+node_modules/
+dist/
+build/
+*.egg-info/
+
+*.jpg
+*.pdf
+

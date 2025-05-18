@@ -17,7 +17,10 @@ def process_frame_for_model(frame, device, img_size=640, half=False):
 def visualize_output(original_frame, da_seg_out, ll_seg_out, lane_task="BOTH"):
     """Overlays drivable area and/or lane lines on the original frame."""
     original_h, original_w = original_frame.shape[:2]
-    output_h, output_w = da_seg_out.shape[1], da_seg_out.shape[2] # Should be model's output size e.g. 640x640
+    # Correctly get the spatial dimensions (height, width) of the model's output mask
+    # da_seg_out has shape (batch_size, num_classes, height, width)
+    # So, height is shape[2] and width is shape[3]
+    output_h, output_w = da_seg_out.shape[2], da_seg_out.shape[3]
 
     result_img = original_frame.copy()
     

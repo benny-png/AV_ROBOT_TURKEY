@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 import sys
-from lane_detection_2.model import config as cfg 
+from . import config as cfg 
 import matplotlib.pyplot as plt
 from torch.nn import Module, Conv2d, Parameter, Softmax
 import cv2

@@ -4,8 +4,10 @@ import time
 import threading
 import argparse
 from queue import Queue, Empty
-from lane_detection.lane_detection import Camera, Line, process_frame
 from ultralytics import YOLO
+import torch
+from lane_detection_2.model.model import TwinLiteNetPlus
+import torch.backends.cudnn as cudnn
 
 class SharedFrame:
     def __init__(self):
@@ -17,8 +19,51 @@ class SharedFrame:
         self.lane_done_event = threading.Event()
         self.yolo_done_event = threading.Event()
 
-def lane_detection_thread(shared_frame, camera, left_line, right_line, stop_event):
-    """Thread function for lane detection processing"""
+def process_lane_frame(frame, lane_model, lane_task="BOTH", device="cuda", half=True):
+    """Process a single frame with TwinLiteNetPlus model for lane detection"""
+    # Prepare image for the model - resize to 640x640 and normalize
+    original_h, original_w = frame.shape[:2]
+    img_resized = cv2.resize(frame, (640, 640))
+    img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).to(device)
+    img_tensor = img_tensor.half() if half else img_tensor.float()
+    img_tensor = img_tensor / 255.0
+    img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
+    
+    # Run inference
+    with torch.no_grad():
+        da_seg_out, ll_seg_out = lane_model(img_tensor)
+    
+    result_img = frame.copy()
+    
+    # Create base for color mask (640x640)
+    color_area_resized = np.zeros((640, 640, 3), dtype=np.uint8)
+    
+    if lane_task == "DA" or lane_task == "BOTH":
+        # Process drivable area output
+        _, da_seg_mask = torch.max(da_seg_out, 1)
+        da_seg_mask = da_seg_mask.int().cpu().numpy()[0] # Shape (640, 640)
+        # Drivable area in green
+        color_area_resized[da_seg_mask == 1] = [0, 255, 0]
+    
+    if lane_task == "LL" or lane_task == "BOTH":
+        # Process lane line output
+        _, ll_seg_mask = torch.max(ll_seg_out, 1)
+        ll_seg_mask = ll_seg_mask.int().cpu().numpy()[0] # Shape (640, 640)
+        # Lane lines in red
+        color_area_resized[ll_seg_mask == 1] = [255, 0, 0]
+    
+    # Resize color mask back to original frame size
+    color_seg_original_size = cv2.resize(color_area_resized, (original_w, original_h))
+    
+    # Overlay the mask onto the original frame
+    # Ensure we only overlay where the mask is not black
+    color_mask_overlay = np.any(color_seg_original_size > [0,0,0], axis=-1)
+    result_img[color_mask_overlay] = result_img[color_mask_overlay] * 0.5 + color_seg_original_size[color_mask_overlay] * 0.5
+    
+    return result_img.astype(np.uint8)
+
+def lane_detection_thread(shared_frame, lane_model, lane_task, device, half, stop_event):
+    """Thread function for lane detection processing using TwinLiteNetPlus"""
     lane_fps = 0
     frame_count = 0
     start_time = time.time()
@@ -34,7 +79,7 @@ def lane_detection_thread(shared_frame, camera, left_line, right_line, stop_even
                 frame = shared_frame.frame.copy()
             
             # Process frame for lane detection
-            processed = process_frame(frame, left_line, right_line, camera)
+            processed = process_lane_frame(frame, lane_model, lane_task, device, half)
             
             # Calculate FPS
             frame_count += 1
@@ -108,26 +153,26 @@ def main():
                       help='Flip the input frame horizontally')
     parser.add_argument('--output', type=str, default='', 
                       help='Output file path for saving video')
+    parser.add_argument('--lane_task', type=str, default='BOTH', choices=['DA', 'LL', 'BOTH'],
+                      help='Lane detection task: DA (Drivable Area), LL (Lane Lines), BOTH. Default: BOTH')
     args = parser.parse_args()
     
+    # Set device and precision
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    half = device != "cpu"  # Use half precision only with CUDA
+    
     # Load YOLO model
-    #model = YOLO("object_and_depth_detection/models/best_v5_n.pt")
+    yolo_model = YOLO("object_and_depth_detection/models/best_v6_n.pt")
 
-    #model.export(format="ncnn")
-
-    model = YOLO("object_and_depth_detection/models/best_v5_n_ncnn_model")
+    # Load TwinLiteNetPlus model with nano configuration
+    lane_model = TwinLiteNetPlus(argparse.Namespace(config="nano"))
+    lane_model.to(device)
+    if half:
+        lane_model.half()
     
-    # Camera calibration data
-    mtx = np.array([[1.43249747e+03, 0.00000000e+00, 6.75431644e+02],
-                   [0.00000000e+00, 1.43065692e+03, 4.57012583e+02],
-                   [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
-    
-    dist = np.array([[ 0.01302033, 0.94139111, -0.00436593, 0.00480621, -3.33015441]])
-    
-    # Initialize camera and lines
-    camera = Camera(mtx, dist)
-    left_line = Line()
-    right_line = Line()
+    # Load pretrained weights
+    lane_model.load_state_dict(torch.load("lane_detection_2/pretrained/TwinLiteNetPlus/nano.pth"))
+    lane_model.eval()
     
     # Setup video capture
     source = args.source
@@ -161,12 +206,12 @@ def main():
     # Start processing threads
     lane_thread = threading.Thread(
         target=lane_detection_thread, 
-        args=(shared_frame, camera, left_line, right_line, stop_event)
+        args=(shared_frame, lane_model, args.lane_task, device, half, stop_event)
     )
     
     yolo_thread = threading.Thread(
         target=yolo_detection_thread, 
-        args=(shared_frame, model, stop_event)
+        args=(shared_frame, yolo_model, stop_event)
     )
     
     lane_thread.daemon = True

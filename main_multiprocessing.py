@@ -5,13 +5,13 @@ import threading
 import multiprocessing as mp
 import argparse
 from queue import Queue, Empty
-from lane_detection.lane_detection import Camera, Line, process_frame
 from ultralytics import YOLO
+import torch
+import torch.backends.cudnn as cudnn
+from lane_detection_2.model.model import TwinLiteNetPlus
 
 # Global variables for process workers
-_process_camera = None
-_process_left_line = None
-_process_right_line = None
+_process_lane_model = None
 _process_yolo_model = None
 
 # Initialize multiprocessing support
@@ -28,30 +28,71 @@ class SharedFrame:
         self.lane_done_event = threading.Event()
         self.yolo_done_event = threading.Event()
 
-def init_lane_worker(camera_mtx, camera_dist):
+def init_lane_worker(model_path):
     """Initialize lane detection worker process"""
-    global _process_camera, _process_left_line, _process_right_line
+    global _process_lane_model
     
-    # Create objects that will persist in this process
-    _process_camera = Camera(camera_mtx, camera_dist)
-    _process_left_line = Line()
-    _process_right_line = Line()
+    # Set device and precision
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    half = device != "cpu"  # Use half precision only with CUDA
     
-def process_lane_frame(frame, left_line_data, right_line_data):
-    """Process a single frame for lane detection using initialized objects"""
-    global _process_camera, _process_left_line, _process_right_line
+    # Create TwinLiteNetPlus model with nano configuration
+    _process_lane_model = TwinLiteNetPlus(argparse.Namespace(config="nano"))
+    _process_lane_model.to(device)
+    if half:
+        _process_lane_model.half()
     
-    # Update line objects with current data from parent process
-    if left_line_data is not None:
-        _process_left_line.__dict__.update(left_line_data)
-    if right_line_data is not None:
-        _process_right_line.__dict__.update(right_line_data)
+    # Load pretrained weights
+    _process_lane_model.load_state_dict(torch.load(model_path))
+    _process_lane_model.eval()
     
-    # Process the frame using the persistent objects
-    result = process_frame(frame, _process_left_line, _process_right_line, _process_camera)
+def process_lane_frame(frame, lane_task="BOTH"):
+    """Process a single frame for lane detection using initialized model"""
+    global _process_lane_model
     
-    # Return both the processed frame and updated line data
-    return result, _process_left_line.__dict__, _process_right_line.__dict__
+    # Determine device and precision from the loaded model
+    device = next(_process_lane_model.parameters()).device
+    half = next(_process_lane_model.parameters()).dtype == torch.float16
+    
+    # Prepare image for the model - resize to 640x640 and normalize
+    original_h, original_w = frame.shape[:2]
+    img_resized = cv2.resize(frame, (640, 640))
+    img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).to(device)
+    img_tensor = img_tensor.half() if half else img_tensor.float()
+    img_tensor = img_tensor / 255.0
+    img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
+    
+    # Run inference
+    with torch.no_grad():
+        da_seg_out, ll_seg_out = _process_lane_model(img_tensor)
+    
+    result_img = frame.copy()
+    
+    # Create base for color mask (640x640)
+    color_area_resized = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    if lane_task == "DA" or lane_task == "BOTH":
+        # Process drivable area output
+        _, da_seg_mask = torch.max(da_seg_out, 1)
+        da_seg_mask = da_seg_mask.int().cpu().numpy()[0]
+        # Drivable area in green
+        color_area_resized[da_seg_mask == 1] = [0, 255, 0]
+    
+    if lane_task == "LL" or lane_task == "BOTH":
+        # Process lane line output
+        _, ll_seg_mask = torch.max(ll_seg_out, 1)
+        ll_seg_mask = ll_seg_mask.int().cpu().numpy()[0]
+        # Lane lines in red
+        color_area_resized[ll_seg_mask == 1] = [255, 0, 0]
+        
+    # Resize color mask back to original frame size
+    color_seg_original_size = cv2.resize(color_area_resized, (original_w, original_h))
+    
+    # Overlay the mask onto the original frame
+    color_mask_overlay = np.any(color_seg_original_size > [0,0,0], axis=-1)
+    result_img[color_mask_overlay] = result_img[color_mask_overlay] * 0.5 + color_seg_original_size[color_mask_overlay] * 0.5
+    
+    return result_img.astype(np.uint8)
 
 def init_yolo_worker(model_path):
     """Initialize YOLO detection worker process"""
@@ -68,7 +109,7 @@ def process_yolo_frame(frame):
     results = _process_yolo_model.track(source=frame, conf=0.1, iou=0.5, tracker="bytetrack.yaml")
     return results[0].plot()
 
-def lane_detection_thread(shared_frame, camera_mtx, camera_dist, left_line, right_line, stop_event):
+def lane_detection_thread(shared_frame, lane_model_path, lane_task, stop_event):
     """Thread function for lane detection processing"""
     lane_fps = 0
     frame_count = 0
@@ -78,12 +119,8 @@ def lane_detection_thread(shared_frame, camera_mtx, camera_dist, left_line, righ
     lane_pool = mp.Pool(
         processes=1, 
         initializer=init_lane_worker, 
-        initargs=(camera_mtx, camera_dist)
+        initargs=(lane_model_path,)
     )
-    
-    # Extract line data for sharing with processes
-    left_line_data = left_line.__dict__.copy()
-    right_line_data = right_line.__dict__.copy()
     
     while not stop_event.is_set():
         # Wait for a new frame
@@ -96,16 +133,10 @@ def lane_detection_thread(shared_frame, camera_mtx, camera_dist, left_line, righ
                 frame = shared_frame.frame.copy()
             
             # Process frame for lane detection in a separate process
-            result = lane_pool.apply(
+            processed = lane_pool.apply(
                 process_lane_frame,
-                args=(frame, left_line_data, right_line_data)
+                args=(frame, lane_task)
             )
-            
-            processed, left_line_data, right_line_data = result
-            
-            # Update the line objects with the new data
-            left_line.__dict__.update(left_line_data)
-            right_line.__dict__.update(right_line_data)
             
             # Calculate FPS
             frame_count += 1
@@ -196,27 +227,13 @@ def main():
                       help='Flip the input frame horizontally')
     parser.add_argument('--output', type=str, default='', 
                       help='Output file path for saving video')
+    parser.add_argument('--lane_task', type=str, default='BOTH', choices=['DA', 'LL', 'BOTH'],
+                      help='Lane detection task: DA (Drivable Area), LL (Lane Lines), BOTH. Default: BOTH')
     args = parser.parse_args()
     
-    # Load YOLO model
-    #model = YOLO("object_and_depth_detection/models/best_v5_n.pt")
-    #model.export(format="ncnn")
-    
-    # Store the model path for passing to processes
-    #model_path = "object_and_depth_detection/models/best_v5_n_ncnn_model"
-    model_path = "object_and_depth_detection/models/best_v5_n.pt"
-    
-    # Camera calibration data
-    mtx = np.array([[1.43249747e+03, 0.00000000e+00, 6.75431644e+02],
-                   [0.00000000e+00, 1.43065692e+03, 4.57012583e+02],
-                   [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
-    
-    dist = np.array([[ 0.01302033, 0.94139111, -0.00436593, 0.00480621, -3.33015441]])
-    
-    # Initialize camera and lines
-    camera = Camera(mtx, dist)
-    left_line = Line()
-    right_line = Line()
+    # Store the model paths for passing to processes
+    yolo_model_path = "object_and_depth_detection/models/best_v6_n.pt"
+    lane_model_path = "lane_detection_2/pretrained/TwinLiteNetPlus/nano.pth"
     
     # Setup video capture
     source = args.source
@@ -250,12 +267,12 @@ def main():
     # Start processing threads
     lane_thread = threading.Thread(
         target=lane_detection_thread, 
-        args=(shared_frame, mtx, dist, left_line, right_line, stop_event)
+        args=(shared_frame, lane_model_path, args.lane_task, stop_event)
     )
     
     yolo_thread = threading.Thread(
         target=yolo_detection_thread, 
-        args=(shared_frame, model_path, stop_event)
+        args=(shared_frame, yolo_model_path, stop_event)
     )
     
     lane_thread.daemon = True
